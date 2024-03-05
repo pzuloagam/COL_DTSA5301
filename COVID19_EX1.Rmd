@@ -1,0 +1,179 @@
+---
+title: "COVID19_EX1"
+author: "pzuloaga"
+date: "2024-03-01"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(lubridate)
+library(dplyr)
+library(ggplot2)
+```
+
+## Objectives
+
+The objective of this data analysis is to study the evolution of COVID 19 pandemic in Peru.
+We will study the trends in the contagion and also in the fatality rate to try to understand how do they correlated to some specific events.
+
+## Read and Import Data
+
+We start reading and importing the date from John Hopkins data set. 
+
+```{r ReadData, message=FALSE}
+
+
+url_in <- "https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/"
+
+file_names <- c("time_series_covid19_confirmed_global.csv", "time_series_covid19_deaths_global.csv")
+
+urls <- str_c(url_in, file_names)
+global_cases <- read_csv(urls[1])
+global_deaths <- read_csv(urls[2])
+
+```
+
+## Tidy and transform Data
+
+We also need to tidy and transform the data: data by date needed to be summarized and we also needed to joint the death and cases data sets, as well as group them by country.
+
+```{r TidyData, message=FALSE}
+
+global_cases <- global_cases %>%
+  pivot_longer(cols = -c('Province/State', 'Country/Region', Lat, Long), names_to = "date", values_to = "cases") %>%
+  select(-c(Lat,Long))
+
+global_deaths <- global_deaths %>%
+  pivot_longer(cols = -c('Province/State', 'Country/Region', Lat, Long), names_to = "date", values_to = "deaths") %>%
+  select(-c(Lat,Long))
+
+global <- global_cases %>% full_join(global_deaths) %>% 
+  rename(Country_Region = 'Country/Region',
+         Province_State = 'Province/State') %>%
+  mutate(date = mdy(date))
+
+global <- global %>% filter(cases > 0)
+
+global <- global %>%
+  unite("Combined_Key", c(Province_State, Country_Region),
+        sep = ", ",
+        na.rm = TRUE,
+        remove = FALSE)
+
+uid_lookup_url <- "https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/UID_ISO_FIPS_LookUp_Table.csv"
+
+uid <- read_csv(uid_lookup_url) %>% select(-c(Lat, Long_, Combined_Key, code3, iso2, iso3, Admin2))
+
+global <- global %>%
+  left_join(uid, by = c("Province_State", "Country_Region")) %>% select(-c(UID, FIPS)) %>% select(Province_State, Country_Region, date, cases, deaths, Population, Combined_Key)
+
+
+global_by_country <- global %>% group_by(Province_State, Country_Region, date) %>% summarize(cases = sum(cases), deaths = sum(deaths), Population = sum(Population)) %>% mutate(deaths_per_mill = deaths *1000000 / Population) %>% select(Province_State, Country_Region, date, cases, deaths, deaths_per_mill, Population) %>% ungroup()
+
+
+```
+
+
+## Visualization
+
+First, we will visualize the general evolution of cases and deaths in Peru:
+```{r visualization1}
+country <- "Peru"
+global_by_country %>% filter(Country_Region == country) %>% filter(cases > 0) %>% 
+  ggplot(aes(x=date, y=cases)) + 
+  geom_point(aes(color ="Total cases"),colour="black") + 
+  geom_point(aes(y=deaths, color="Total deaths"),colour="red") + 
+  xlab("Date") +
+  ylab("Count") +
+  scale_y_log10() + 
+  theme_minimal() +
+  theme(legend.position="bottom", axis.text.x = element_text(angle = 90)) + 
+  labs(title = str_c("Cases and Deaths during Pandemic COVID-19: ", country), y=NULL)
+
+```
+
+This plot is good to understand the evolution of the total cases, but it may be more revealing to analyze how the pandemic evolved in Peru in terms of the new cases, since this value may reveal the waves in the contagion process. This could be helpful to evaluate how the health system responded and what limitations did they have. So, will transform the data to get the new cases day by day.
+
+
+```{r visualization2}
+
+country <- "Peru"
+global_by_country %>% filter(Country_Region == country) %>% filter(cases > 0) %>%  
+    mutate(new_cases = cases - lag(cases),
+      new_deaths = deaths - lag(deaths)) %>%
+      filter(new_cases > 0, new_deaths > 0) %>%  
+    ggplot(aes(x = date, y = new_cases)) +
+      geom_line(aes(color = "new_cases"),colour="black")+
+      geom_point(aes(color= "new_cases"),colour="black") +
+      geom_line(aes(y = new_deaths, color = "new_deaths"),colour="red") +
+      geom_point(aes(y = new_deaths, color = "new_deaths"),colour="red")+
+      scale_y_log10()+
+      theme_minimal() +
+      theme(legend.position = "bottom",
+      axis.text.x = element_text(angle = 90))+
+      labs(title = "New COVID-19 in Peru", y = NULL)
+
+
+```
+From this new plot we can discovered there was five big waves in contagion. We can associate the first two to the variants alpha and delta, and we can clearly see how after 2022 the waves started to mimic as a seasonal flu, quite different from the two first cycles. We can also see that the third wave -at the begging of 2022- had the historical peak in cases, however, the deaths in this period were quite lower compared to the first two waves. This is related to the fact that by the beginning of 2022 Peru reached a vaccination of 80% of the total population.
+
+To further analyze this effect, we will try to model the fatality rate.
+
+## Modeling
+
+We will define the fatality rate as deaths/cases. If we try to adjust the whole data to a linear trend we will see that it is not possible:
+
+```{r model21}
+
+mod = lm(deaths ~ cases, data = global_by_country %>% filter(Country_Region == "Peru"))
+summary(mod)
+
+Per_pred = global_by_country %>% filter(Country_Region == "Peru")%>%
+  mutate(pred = predict(mod), year=year(date))
+  Per_pred %>% ggplot() +
+  geom_point(aes(x = cases, y = deaths, color = "Actual"), shape = 1, size = 2) +
+  geom_line(aes(x = cases, y = pred, color = "Predicted"))+
+  scale_color_manual(name = "Death Count", values = c("Actual" = "blue", "Predicted" = "black"))+
+  xlab("No. of Cases")+
+  ylab("No. of Deaths")+
+  theme_minimal()+
+  ggtitle("COVID-19 in Peru, Cases vs Deaths all dates")
+
+```
+There are two main obvious trends, that clearly shows a change in the fatality rate, i.e. much lower deaths for the same amount of cases. Then, we can filter the data to the first period:
+
+```{r model2}
+
+mod = lm(deaths ~ cases, data = global_by_country %>% filter(Country_Region == "Peru", date < '2022-01-01'))
+summary(mod)
+
+Per_pred = global_by_country %>% filter(Country_Region == "Peru", date < '2022-01-01')%>%
+  mutate(pred = predict(mod))
+  Per_pred %>% ggplot() +
+  geom_point(aes(x = cases, y = deaths, color = "Actual"), shape = 1, size = 2) +
+  geom_line(aes(x = cases, y = pred, color = "Predicted"))+
+  scale_color_manual(name = "Death Count", values = c("Actual" = "blue", "Predicted" = "black"))+
+  xlab("No. of Cases")+
+  ylab("No. of Deaths")+
+  theme_minimal()+
+  ggtitle("COVID-19 in Peru: Cases vs Deaths before Vaccination reaches 80%")
+
+```
+
+If we filter the data for the date before 01/01/2022 we can see that linear trend has a better matching. So, in this period we can actually model the number of death based on the number of cases, since this represent a quite similar contagion situation.
+
+## Conclusion and Possible Biases
+
+From this analysis we can see the data set can be helpful to understand the development of the COVID-19. In particular, for Peru we can identify five waves of contagion, and two different behaviors of the disease, each one with a different fatality rate, that is correlated with the change in the spread due to a high rate of vaccination.
+There may be some bias the recording of the data, since many methodologies were used during its evolution. There was also a high involvement form the government to try to minimize the reported cases and fatalities specially during the peaks. Since the John Hopkins data set takes the official reports by country, they may have an inherent bias because of the country's transparency to record and report this data.
+
+```{r session}
+
+sessionInfo()
+
+```
